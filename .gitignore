@@ -25,3 +25,10 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# 构建中间产物
+*.new
+*.baseline
+
+# 刷机前本地备份
+.backup/

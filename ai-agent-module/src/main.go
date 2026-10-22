@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	_ "embed"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
 	"io"
@@ -78,12 +79,16 @@ func nextToolID() int {
 	return int(atomic.AddInt64(&toolSeq, 1))
 }
 
+// truncate cuts by runes, not bytes.
+// A CJK character is 3 bytes; slicing by byte splits the UTF-8 sequence
+// and produces mojibake (seen on device with screen node labels).
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 func broadcast(e event) {
@@ -215,16 +220,41 @@ func httpClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// configPath is the user-editable config location.
+// It lives in home (/data/adb/aiagent/) rather than the module dir so that
+// flashing a module update does not overwrite the user configuration.
+func configPath() string {
+	return filepath.Join(home, "config.json")
+}
+
 func loadConfig() {
-	p := filepath.Join(modDir, "config.json")
-	b, err := os.ReadFile(p)
-	if err != nil {
-		log.Printf("config read error: %v", err)
-		return
+	// Prefer the user config; fall back to the factory template shipped in the
+	// module directory, which is where older versions stored the config.
+	candidates := []string{configPath(), filepath.Join(modDir, "config.json")}
+	var (
+		b    []byte
+		err  error
+		used string
+	)
+	for _, p := range candidates {
+		if b, err = os.ReadFile(p); err == nil {
+			used = p
+			break
+		}
 	}
+	// Default to auto-opening the chat UI. Set before reading the file so a config
+	// without an autoopen field keeps it true (it used to be set only on success).
 	cfg.AutoOpen = true
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		log.Printf("config parse error: %v", err)
+	if used == "" {
+		// This used to return early, which skipped every default when the config file
+		// was missing — most visibly Port stayed 0 and the server bound to a random
+		// port, so the UI could never connect. Log and fall through to defaults now.
+		log.Printf("config read error: %v (using defaults)", err)
+	} else {
+		log.Printf("config loaded: %s", used)
+		if e := json.Unmarshal(b, &cfg); e != nil {
+			log.Printf("config parse error: %v", e)
+		}
 	}
 	prov := strings.ToLower(strings.TrimSpace(cfg.Provider))
 	switch prov {
@@ -283,6 +313,7 @@ func loadConfig() {
 			"RULE 2: The word 'buka' is CONTEXTUAL - decide the target: a file/folder/path -> open_path, a web link -> open_url, an installed app name -> open_app. Do NOT assume 'buka' always means an app. " +
 			"RULE 3: Chain multiple tool calls until the task is finished (e.g. make_dir -> write_file -> read_file), then summarize briefly. " +
 			"Tools: open_app (app), open_path (file/folder), open_url, web_search, run_shell (root), write_file, read_file, list_dir, make_dir, move_file, delete_path, download_url, schedule_message (auto reminder after N seconds; use delay_seconds). " +
+			"SCREEN TOOLS: screen (read current UI tree with tap coordinates), tap (x,y from screen), swipe, key (HOME/BACK/ENTER/...), text (type into focused field), screenshot (save PNG). " +
 			"Default save location: /storage/emulated/0/Download. Always use absolute paths. Reply concisely in Indonesian. " +
 			"FINALLY: on the very last line of every answer, add exactly one line starting with 'SARAN:' followed by 2-4 short follow-up actions the user may want next, separated by ' | ' (Bahasa Indonesia, no quotes). Example: 'SARAN: Buka file hasil unduhan | Lihat folder Download | Cek sisa storage'."
 	}
@@ -293,7 +324,8 @@ func saveConfig() {
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(filepath.Join(modDir, "config.json"), b, 0644); err != nil {
+	// 0600: the file holds the API key, keep it away from other apps
+	if err := os.WriteFile(configPath(), b, 0600); err != nil {
 		log.Printf("config save error: %v", err)
 	}
 }
@@ -347,6 +379,13 @@ func notify(title, text, url string) {
 	if url == "" {
 		return
 	}
+	// Give up when the app is not installed. Otherwise am start retries 30 times
+	// at 4s intervals and floods the log (module kept, app uninstalled is common).
+	if out, err := exec.Command("pm", "list", "packages", "com.zafxyra.agent").Output(); err != nil ||
+		!strings.Contains(string(out), "com.zafxyra.agent") {
+		log.Printf("notify skipped: com.zafxyra.agent not installed")
+		return
+	}
 	// Jaga-jaga: pastikan app boleh posting notif (bisa ke-reset setelah reinstall)
 	for _, g := range [][]string{
 		{"pm", "grant", "com.zafxyra.agent", "android.permission.POST_NOTIFICATIONS"},
@@ -355,8 +394,9 @@ func notify(title, text, url string) {
 	} {
 		exec.Command(g[0], g[1:]...).Run()
 	}
-	// Retry: PMS/user belum siap tepat setelah boot ('Activity class does not exist')
-	for i := 0; i < 30; i++ {
+	// Retry: PMS/user belum siap tepat setelah boot ('Activity class does not exist').
+	// Bounded to 8 attempts with growing delays instead of spinning forever.
+	for i := 0; i < 8; i++ {
 		out, err := exec.Command("am", "start", "-n", "com.zafxyra.agent/.MainActivity",
 			"--es", "url", url, "--ez", "boot", "true").CombinedOutput()
 		s := string(out)
@@ -364,13 +404,13 @@ func notify(title, text, url string) {
 			return
 		}
 		log.Printf("am start attempt %d: %s", i+1, strings.TrimSpace(s))
-		time.Sleep(4 * time.Second)
+		time.Sleep(time.Duration(2+i) * time.Second)
 	}
 }
 
 func callLLM(msgs []Msg) (string, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return "", fmt.Errorf("API key belum di-set. Ambil key gratis di aistudio.google.com, masukkan ke %s lalu restart module.", filepath.Join(modDir, "config.json"))
+		return "", fmt.Errorf("API key not set. Put it in %s and restart the module (or set it in the chat UI).", configPath())
 	}
 	if cfg.Provider == "openai" {
 		return callOpenAI(msgs)
@@ -635,6 +675,13 @@ func toolDecls() []interface{} {
 		gemTool("download_url", "Unduh file dari internet lalu simpan ke path di HP.", map[string]interface{}{"url": gemStr("URL file yang diunduh"), "path": gemStr("path tujuan penyimpanan")}, []string{"url", "path"}),
 		gemTool("open_path", "Buka sebuah FILE atau FOLDER di HP dengan aplikasi penampil/pengelola bawaan. Pakai untuk permintaan seperti 'buka file catatan.txt', 'buka folder Download', 'buka foto/video/musik'. BUKAN untuk aplikasi; untuk aplikasi pakai open_app.", map[string]interface{}{"path": gemStr("path absolut file atau folder, mis. /storage/emulated/0/Download/catatan.txt")}, []string{"path"}),
 		gemTool("schedule_message", "Jadwalkan PESAN OTOMATIS dari agent ke pengguna setelah jeda waktu tertentu (pengingat/reminder). Agent mengirim pesan ini sendiri tanpa ditanya lagi. Pakai saat pengguna minta diingatkan sesuatu, mis. 'ingetin 10 menit lagi minum obat'.", map[string]interface{}{"delay_seconds": map[string]interface{}{"type": "INTEGER", "description": "jeda waktu dalam detik sebelum pesan dikirim"}, "message": gemStr("isi pesan pengingat yang akan dikirim nanti")}, []string{"delay_seconds", "message"}),
+		// ---- UI automation: let the agent actually operate the screen, not just launch apps ----
+		gemTool("screen", "Read the current UI tree and return clickable nodes with their center coordinates. Prefer this over screenshots when you need to see the screen, find a button, or confirm the previous action took effect.", map[string]interface{}{}, []string{}),
+		gemTool("tap", "Tap screen coordinates. Coordinates must come from the @(x,y) values returned by screen; do not guess. duration_ms>=400 is treated as a long press.", map[string]interface{}{"x": map[string]interface{}{"type": "INTEGER", "description": "x coordinate"}, "y": map[string]interface{}{"type": "INTEGER", "description": "y coordinate"}, "duration_ms": map[string]interface{}{"type": "INTEGER", "description": "hold duration in ms, default 80; >=400 means long press"}}, []string{"x", "y"}),
+		gemTool("swipe", "Swipe across the screen to scroll lists, change pages, or pull down the notification shade.", map[string]interface{}{"x1": map[string]interface{}{"type": "INTEGER", "description": "start x"}, "y1": map[string]interface{}{"type": "INTEGER", "description": "start y"}, "x2": map[string]interface{}{"type": "INTEGER", "description": "end x"}, "y2": map[string]interface{}{"type": "INTEGER", "description": "end y"}, "duration_ms": map[string]interface{}{"type": "INTEGER", "description": "swipe duration in ms, default 300"}}, []string{"x1", "y1", "x2", "y2"}),
+		gemTool("key", "Send a key event such as back, home, enter, or delete.", map[string]interface{}{"key": gemStr("HOME/BACK/ENTER/POWER/TAB/DEL/MENU/RECENT/VOLUP/VOLDOWN, or a numeric keycode")}, []string{"key"}),
+		gemTool("text", "Type text into the focused input field. Uses ADBKeyboard when available for full Unicode; otherwise falls back to input text, which is ASCII-only.", map[string]interface{}{"text": gemStr("text to type")}, []string{"text"}),
+		gemTool("screenshot", "Capture the screen to a PNG file and return its path. Only use this when screen cannot describe the UI (pure graphics).", map[string]interface{}{"path": gemStr("save path; defaults to /storage/emulated/0/Download")}, []string{}),
 	)
 	return []interface{}{
 		map[string]interface{}{"functionDeclarations": funcs},
@@ -829,8 +876,8 @@ var commonDirs = map[string]string{
 var fileExtMime = map[string]string{
 	"txt": "text/plain", "md": "text/plain", "log": "text/plain", "json": "application/json",
 	"csv": "text/csv", "xml": "text/xml", "html": "text/html", "htm": "text/html",
-	"pdf":  "application/pdf",
-	"jpg":  "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif",
+	"pdf": "application/pdf",
+	"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif",
 	"webp": "image/webp", "bmp": "image/bmp", "svg": "image/svg+xml", "heic": "image/heic",
 	"mp3": "audio/mpeg", "wav": "audio/x-wav", "m4a": "audio/mp4", "ogg": "audio/ogg",
 	"flac": "audio/flac", "aac": "audio/aac",
@@ -988,6 +1035,290 @@ func runShell(cmd string) (string, error) {
 	return s, nil
 }
 
+// ==================== UI automation ====================
+//
+// This group lets the agent actually see and operate the screen instead of
+// only launching apps. Built entirely on Android's own uiautomator / input /
+// screencap — no third-party dependencies.
+//
+// Design trade-offs:
+//   - Prefer the uiautomator UI tree over screenshots: an order of magnitude
+//     cheaper in tokens, and it yields tap coordinates directly so the model
+//     never has to guess a position from an image.
+//   - Every coordinate is the center of the node bounds, so the model can copy
+//     it verbatim, which keeps taps from drifting.
+
+const uiDumpPath = "/data/local/tmp/.agentd_ui.xml"
+
+type uiNodeXML struct {
+	Text       string      `xml:"text,attr"`
+	Desc       string      `xml:"content-desc,attr"`
+	Class      string      `xml:"class,attr"`
+	Package    string      `xml:"package,attr"`
+	Clickable  string      `xml:"clickable,attr"`
+	Scrollable string      `xml:"scrollable,attr"`
+	Enabled    string      `xml:"enabled,attr"`
+	Bounds     string      `xml:"bounds,attr"`
+	Nodes      []uiNodeXML `xml:"node"`
+}
+
+// parseBounds parses uiautomator's "[x1,y1][x2,y2]" bounds string.
+// Returns zeros and false on a partial parse so callers never act on half a rect.
+func parseBounds(s string) (x1, y1, x2, y2 int, ok bool) {
+	var a, b, c, d int
+	n, err := fmt.Sscanf(s, "[%d,%d][%d,%d]", &a, &b, &c, &d)
+	if err != nil || n != 4 {
+		return 0, 0, 0, 0, false
+	}
+	return a, b, c, d, true
+}
+
+// currentWindow returns the focused window. Informational only; empty on failure.
+func currentWindow() string {
+	out, err := exec.Command("sh", "-c",
+		"dumpsys window 2>/dev/null | grep -E 'mCurrentFocus|mFocusedApp' | head -2").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	s := strings.TrimSpace(string(out))
+	if len(s) > 300 {
+		s = s[:300]
+	}
+	return s
+}
+
+// uiDumpXML dumps the UI hierarchy. Prefers --compressed (~60% smaller in
+// testing) and falls back to a plain dump when unsupported.
+func uiDumpXML() ([]byte, error) {
+	_ = exec.Command("sh", "-c", "rm -f "+uiDumpPath).Run()
+
+	try := func(flagArg string) bool {
+		_ = exec.Command("sh", "-c",
+			"uiautomator dump "+flagArg+" "+uiDumpPath+" >/dev/null 2>&1").Run()
+		st, err := os.Stat(uiDumpPath)
+		return err == nil && st.Size() > 0
+	}
+	if !try("--compressed") && !try("") {
+		return nil, fmt.Errorf("uiautomator dump failed: screen may be FLAG_SECURE, or automation is restricted")
+	}
+	data, err := os.ReadFile(uiDumpPath)
+	_ = os.Remove(uiDumpPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read dump result: %v", err)
+	}
+	return data, nil
+}
+
+// parseUILines flattens the uiautomator XML into "label @center" lines.
+// Extracted from screenTool so it can be unit-tested without a device.
+func parseUILines(data []byte) ([]string, error) {
+	var root uiNodeXML
+	if err := xml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse UI XML: %v", err)
+	}
+
+	var lines []string
+	var walk func(n uiNodeXML, depth int)
+	walk = func(n uiNodeXML, depth int) {
+		label := strings.TrimSpace(n.Text)
+		if label == "" {
+			label = strings.TrimSpace(n.Desc)
+		}
+		if label != "" && depth < 48 {
+			if x1, y1, x2, y2, ok := parseBounds(n.Bounds); ok {
+				cls := n.Class
+				if i := strings.LastIndex(cls, "."); i >= 0 {
+					cls = cls[i+1:]
+				}
+				var flags []string
+				if n.Clickable == "true" {
+					flags = append(flags, "clickable")
+				}
+				if n.Scrollable == "true" {
+					flags = append(flags, "scrollable")
+				}
+				if n.Enabled == "false" {
+					flags = append(flags, "disabled")
+				}
+				label = strings.ReplaceAll(strings.ReplaceAll(label, "\n", " "), "\r", "")
+				lines = append(lines, fmt.Sprintf("[%d] %s @(%d,%d) %s %s",
+					len(lines)+1, truncate(label, 60), (x1+x2)/2, (y1+y2)/2,
+					cls, strings.Join(flags, " ")))
+			}
+		}
+		for _, c := range n.Nodes {
+			walk(c, depth+1)
+		}
+	}
+	walk(root, 0)
+	return lines, nil
+}
+
+// screenTool returns a compact view of the screen: one line per labelled node,
+// with its center coordinate.
+func screenTool() (string, error) {
+	data, err := uiDumpXML()
+	if err != nil {
+		return "", err
+	}
+	lines, err := parseUILines(data)
+	if err != nil {
+		return "", err
+	}
+
+	win := currentWindow()
+	head := ""
+	if win != "" {
+		head = "Current window: " + win + "\n\n"
+	}
+	if len(lines) == 0 {
+		return head + "(no labelled nodes found: FLAG_SECURE screen or pure graphics)", nil
+	}
+	if len(lines) > 90 {
+		total := len(lines)
+		lines = append(lines[:90], fmt.Sprintf("...and %d more nodes", total-90))
+	}
+	return head + strings.Join(lines, "\n"), nil
+}
+
+func tapTool(x, y, durMs int) (string, error) {
+	if x < 0 || y < 0 || x > 20000 || y > 20000 {
+		return "", fmt.Errorf("invalid coordinates: (%d,%d)", x, y)
+	}
+	var cmd string
+	if durMs >= 400 {
+		cmd = fmt.Sprintf("input swipe %d %d %d %d %d", x, y, x, y, durMs)
+	} else {
+		cmd = fmt.Sprintf("input tap %d %d", x, y)
+	}
+	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("tap failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if durMs >= 400 {
+		return fmt.Sprintf("long-pressed (%d,%d) for %dms", x, y, durMs), nil
+	}
+	return fmt.Sprintf("tapped (%d,%d)", x, y), nil
+}
+
+func swipeTool(x1, y1, x2, y2, durMs int) (string, error) {
+	if durMs <= 0 {
+		durMs = 300
+	}
+	cmd := fmt.Sprintf("input swipe %d %d %d %d %d", x1, y1, x2, y2, durMs)
+	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("swipe failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return fmt.Sprintf("swiped (%d,%d) -> (%d,%d) in %dms", x1, y1, x2, y2, durMs), nil
+}
+
+var keyNames = map[string]string{
+	"HOME": "3", "BACK": "4", "ENTER": "66", "POWER": "26", "TAB": "61",
+	"DEL": "67", "BACKSPACE": "67", "MENU": "82", "SEARCH": "84",
+	"RECENT": "187", "APP_SWITCH": "187", "SPACE": "62", "CAMERA": "27",
+	"WAKEUP": "224", "SLEEP": "223", "MUTE": "164", "PLAYPAUSE": "85",
+	"VOLUP": "24", "VOLDOWN": "25", "UP": "19", "DOWN": "20",
+	"LEFT": "21", "RIGHT": "22", "CENTER": "23",
+}
+
+func keyTool(k string) (string, error) {
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return "", fmt.Errorf("missing key name")
+	}
+	code := k
+	if v, ok := keyNames[strings.ToUpper(k)]; ok {
+		code = v
+	}
+	// Accept digits only: never splice model output into a shell command.
+	if _, err := strconv.Atoi(code); err != nil {
+		return "", fmt.Errorf("unknown key: %s (use HOME/BACK/ENTER/POWER/TAB or a numeric keycode)", k)
+	}
+	if out, err := exec.Command("sh", "-c", "input keyevent "+code).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("key event failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return "pressed " + strings.ToUpper(k) + " (" + code + ")", nil
+}
+
+var (
+	adbKbOnce sync.Once
+	adbKbOK   bool
+)
+
+// hasADBKeyboard reports whether ADBKeyboard is installed (an IME that can
+// reliably inject arbitrary UTF-8).
+func hasADBKeyboard() bool {
+	adbKbOnce.Do(func() {
+		out, _ := exec.Command("sh", "-c",
+			"pm list packages 2>/dev/null | grep -q com.android.adbkeyboard && echo yes").CombinedOutput()
+		adbKbOK = strings.TrimSpace(string(out)) == "yes"
+	})
+	return adbKbOK
+}
+
+// textTool types into the focused field.
+//
+// Non-ASCII is the long-standing problem: Android's `input text` only handles
+// ASCII reliably. Two-stage fallback: ADBKeyboard broadcast (most reliable),
+// then plain input text, and an explicit hint when the text may not appear.
+func textTool(s string) (string, error) {
+	if s == "" {
+		return "", fmt.Errorf("text is empty")
+	}
+	ascii := true
+	for _, r := range s {
+		if r < 32 || r > 126 {
+			ascii = false
+			break
+		}
+	}
+
+	if hasADBKeyboard() {
+		q := strings.ReplaceAll(s, `"`, `\"`)
+		cmd := `am broadcast -a ADB_INPUT_TEXT --es msg "` + q + `"`
+		if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err == nil {
+			_ = out
+			return "typed (ADBKeyboard broadcast)", nil
+		}
+	}
+
+	// Escape for a single-quoted shell string: ' -> '\''
+	q := strings.ReplaceAll(s, "'", `'\''`)
+	out, err := exec.Command("sh", "-c", "input text '"+q+"'").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("input failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	if !ascii {
+		return "attempted to type non-ASCII text. input text has limited support for it; " +
+			"if nothing appeared in the field, install ADBKeyboard and retry.", nil
+	}
+	return "typed", nil
+}
+
+func screenshotTool(savePath string) (string, error) {
+	if strings.TrimSpace(savePath) == "" {
+		savePath = "/storage/emulated/0/Download/shot_" +
+			time.Now().Format("20060102_150405") + ".png"
+	}
+	savePath = expandPath(savePath)
+
+	tmp := "/data/local/tmp/.agentd_shot.png"
+	_ = exec.Command("sh", "-c", "rm -f "+tmp).Run()
+	if out, err := exec.Command("sh", "-c", "screencap -p "+tmp).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("screencap failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	st, err := os.Stat(tmp)
+	if err != nil || st.Size() == 0 {
+		return "", fmt.Errorf("screencap produced no file (screen may be FLAG_SECURE)")
+	}
+	if out, err := exec.Command("sh", "-c",
+		"cp "+tmp+" "+shellQuote(savePath)+" && chmod 0666 "+shellQuote(savePath)).CombinedOutput(); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("failed to save to %s: %v (%s)", savePath, err, strings.TrimSpace(string(out)))
+	}
+	_ = os.Remove(tmp)
+	return fmt.Sprintf("screenshot saved: %s (%d KB)", savePath, st.Size()/1024), nil
+}
+
 func resultOrErr(msg string, err error) string {
 	if err != nil {
 		return err.Error()
@@ -1044,6 +1375,28 @@ func toolStatus(name string, args map[string]interface{}) string {
 			return fmt.Sprintf("Menjadwalkan pengingat (%d detik)...", d)
 		}
 		return "Menjadwalkan pengingat..."
+	// ---- UI automation ----
+	case "screen":
+		return "Membaca layar..."
+	case "tap":
+		if x, y := int(numArg(args, "x")), int(numArg(args, "y")); x > 0 || y > 0 {
+			return fmt.Sprintf("Mengetuk (%d,%d)...", x, y)
+		}
+		return "Mengetuk layar..."
+	case "swipe":
+		return "Menggeser layar..."
+	case "key":
+		if k := argStr(args, "key"); k != "" {
+			return "Menekan tombol " + strings.ToUpper(k) + "..."
+		}
+		return "Menekan tombol..."
+	case "text":
+		if t := argStr(args, "text"); t != "" {
+			return "Mengetik \"" + truncate(t, 20) + "\"..."
+		}
+		return "Mengetik..."
+	case "screenshot":
+		return "Mengambil tangkapan layar..."
 	}
 	return ""
 }
@@ -1111,6 +1464,28 @@ func execToolInner(name string, args map[string]interface{}) string {
 		msg := str("message")
 		log.Printf("[tool] schedule_message delay=%ds msg=%q", delay, msg)
 		return scheduleMessage(delay, msg)
+	case "screen":
+		log.Printf("[tool] screen")
+		return resultOrErr(screenTool())
+	case "tap":
+		x, y := int(numArg(args, "x")), int(numArg(args, "y"))
+		log.Printf("[tool] tap (%d,%d)", x, y)
+		return resultOrErr(tapTool(x, y, int(numArg(args, "duration_ms"))))
+	case "swipe":
+		log.Printf("[tool] swipe")
+		return resultOrErr(swipeTool(
+			int(numArg(args, "x1")), int(numArg(args, "y1")),
+			int(numArg(args, "x2")), int(numArg(args, "y2")),
+			int(numArg(args, "duration_ms"))))
+	case "key":
+		log.Printf("[tool] key %q", str("key"))
+		return resultOrErr(keyTool(str("key")))
+	case "text":
+		log.Printf("[tool] text %q", truncate(str("text"), 40))
+		return resultOrErr(textTool(str("text")))
+	case "screenshot":
+		log.Printf("[tool] screenshot")
+		return resultOrErr(screenshotTool(str("path")))
 	default:
 		return "aksi tidak dikenal: " + name
 	}
@@ -1535,7 +1910,7 @@ func openAIStepStream(url string, reqBody map[string]interface{}, onToken func(s
 	reader := bufio.NewReader(resp.Body)
 	var content strings.Builder
 	type acc struct {
-		id  string
+		id   string
 		name string
 		args string
 	}
@@ -1785,6 +2160,13 @@ func openAIToolDecls() []interface{} {
 		add("download_url", "Unduh file dari internet lalu simpan ke path di HP.", map[string]interface{}{"url": prop("string", "URL file yang diunduh"), "path": prop("string", "path tujuan penyimpanan")}, []string{"url", "path"}),
 		add("open_path", "Buka sebuah FILE atau FOLDER di HP dengan aplikasi penampil/pengelola bawaan. Pakai untuk permintaan seperti 'buka file catatan.txt', 'buka folder Download', 'buka foto/video/musik'. BUKAN untuk aplikasi; untuk aplikasi pakai open_app.", map[string]interface{}{"path": prop("string", "path absolut file atau folder")}, []string{"path"}),
 		add("schedule_message", "Jadwalkan PESAN OTOMATIS dari agent ke pengguna setelah jeda waktu tertentu (pengingat/reminder). Agent mengirim pesan ini sendiri tanpa ditanya lagi. Pakai saat pengguna minta diingatkan sesuatu, mis. 'ingetin 10 menit lagi minum obat'.", map[string]interface{}{"delay_seconds": prop("integer", "jeda waktu dalam detik sebelum pesan dikirim"), "message": prop("string", "isi pesan pengingat yang akan dikirim nanti")}, []string{"delay_seconds", "message"}),
+		// ---- UI automation: let the agent actually operate the screen, not just launch apps ----
+		add("screen", "Read the current UI tree and return clickable nodes with their center coordinates. Prefer this over screenshots when you need to see the screen, find a button, or confirm the previous action took effect.", map[string]interface{}{}, []string{}),
+		add("tap", "Tap screen coordinates. Coordinates must come from the @(x,y) values returned by screen; do not guess. duration_ms>=400 is treated as a long press.", map[string]interface{}{"x": prop("integer", "x coordinate"), "y": prop("integer", "y coordinate"), "duration_ms": prop("integer", "hold duration in ms, default 80; >=400 means long press")}, []string{"x", "y"}),
+		add("swipe", "Swipe across the screen to scroll lists, change pages, or pull down the notification shade.", map[string]interface{}{"x1": prop("integer", "start x"), "y1": prop("integer", "start y"), "x2": prop("integer", "end x"), "y2": prop("integer", "end y"), "duration_ms": prop("integer", "swipe duration in ms, default 300")}, []string{"x1", "y1", "x2", "y2"}),
+		add("key", "Send a key event such as back, home, enter, or delete.", map[string]interface{}{"key": prop("string", "HOME/BACK/ENTER/POWER/TAB/DEL/MENU/RECENT/VOLUP/VOLDOWN, or a numeric keycode")}, []string{"key"}),
+		add("text", "Type text into the focused input field. Uses ADBKeyboard when available for full Unicode; otherwise falls back to input text, which is ASCII-only.", map[string]interface{}{"text": prop("string", "text to type")}, []string{"text"}),
+		add("screenshot", "Capture the screen to a PNG file and return its path. Only use this when screen cannot describe the UI (pure graphics).", map[string]interface{}{"path": prop("string", "save path; defaults to /storage/emulated/0/Download")}, []string{}),
 	)
 	return funcs
 }
@@ -2020,6 +2402,71 @@ func handleReset(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
 }
 
+// handleConfig lets the user change settings from the chat UI instead of
+// editing JSON with a root editor. GET never returns the api_key itself,
+// only whether one is set.
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	switch r.Method {
+	case http.MethodGet:
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"provider":    cfg.Provider,
+			"base_url":    cfg.BaseURL,
+			"model":       cfg.Model,
+			"max_tokens":  cfg.MaxTokens,
+			"port":        cfg.Port,
+			"has_key":     strings.TrimSpace(cfg.APIKey) != "",
+			"allow_shell": shellAllowed(),
+			"config_path": configPath(),
+		})
+	case http.MethodPost:
+		var body struct {
+			APIKey    string `json:"api_key"`
+			BaseURL   string `json:"base_url"`
+			Model     string `json:"model"`
+			MaxTokens int    `json:"max_tokens"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"ok":false,"error":"bad json"}`, http.StatusBadRequest)
+			return
+		}
+		if v := strings.TrimSpace(body.APIKey); v != "" {
+			cfg.APIKey = v
+		}
+		if v := strings.TrimSpace(body.BaseURL); v != "" {
+			cfg.BaseURL = v
+			// provider must match base_url or requests fail silently in the wrong
+			// protocol. Google's endpoint is gemini; everything else is OpenAI-compatible
+			// (DeepSeek / OpenRouter / local llama.cpp all are).
+			if strings.Contains(v, "generativelanguage.googleapis.com") {
+				cfg.Provider = "gemini"
+			} else {
+				cfg.Provider = "openai"
+			}
+		}
+		if v := strings.TrimSpace(body.Model); v != "" {
+			cfg.Model = v
+			// Put the new model first in the picker list and de-duplicate, otherwise the
+			// dropdown cannot select it (cfg.Model changed but the list came from cfg.Models).
+			list := []string{v}
+			for _, m := range cfg.Models {
+				if m != v {
+					list = append(list, m)
+				}
+			}
+			cfg.Models = list
+		}
+		if body.MaxTokens > 0 {
+			cfg.MaxTokens = body.MaxTokens
+		}
+		saveConfig()
+		log.Printf("[config] updated via UI (key set=%v model=%q)", cfg.APIKey != "", cfg.Model)
+		fmt.Fprint(w, `{"ok":true}`)
+	default:
+		http.Error(w, `{"ok":false,"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
 func main() {
 	defMod := ""
 	if exe, err := os.Executable(); err == nil {
@@ -2045,7 +2492,32 @@ func main() {
 	mux.HandleFunc("/model/random", handleRandomModel)
 	mux.HandleFunc("/history", handleHistory)
 	mux.HandleFunc("/reset", handleReset)
+	mux.HandleFunc("/config", handleConfig)
 	mux.HandleFunc("/events", handleEvents)
+
+	// Debug endpoint, mounted only when AGENTD_DEBUG=1. Lets you exercise tools
+	// (screen/tap/...) on a real device without a working LLM first. Absent by
+	// default, so production behaviour is unchanged.
+	if os.Getenv("AGENTD_DEBUG") == "1" {
+		mux.HandleFunc("/debug/tool", func(w http.ResponseWriter, r *http.Request) {
+			name := r.URL.Query().Get("name")
+			if name == "" {
+				http.Error(w, "missing name", http.StatusBadRequest)
+				return
+			}
+			args := map[string]interface{}{}
+			if raw := r.URL.Query().Get("args"); raw != "" {
+				if err := json.Unmarshal([]byte(raw), &args); err != nil {
+					http.Error(w, "bad args json: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+			log.Printf("[debug] tool=%s args=%v", name, args)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprint(w, execToolInner(name, args))
+		})
+		log.Printf("debug endpoint enabled: /debug/tool")
+	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", cfg.Port)
 	go func() {
